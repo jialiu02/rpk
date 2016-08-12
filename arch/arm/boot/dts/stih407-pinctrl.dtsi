@@ -230,6 +230,13 @@
 					};
 				};
 
+				pinctrl_rgmii1_mdio_1: rgmii1-mdio-1 {
+					st,pins {
+						mdio = <&pio1 0 ALT1 OUT BYPASS 0>;
+						mdc = <&pio1 1 ALT1 OUT NICLK 0 CLK_A>;
+					};
+				};
+
 				pinctrl_mii1: mii1 {
 					st,pins {
 						txd0 = <&pio0 0 ALT1 OUT SE_NICLK_IO 0 CLK_A>;
@@ -521,6 +528,12 @@
 					st,pins {
 						sda = <&pio15 6 ALT2 BIDIR>;
 						scl = <&pio15 5 ALT2 BIDIR>;
+					};
+				};
+				pinctrl_i2c2_alt2_1: i2c2-alt2-1 {
+					st,pins {
+						sda = <&pio12 6 ALT2 BIDIR>;
+						scl = <&pio12 5 ALT2 BIDIR>;
 					};
 				};
 			};
@@ -916,6 +929,15 @@
 			interrupt-names = "irqmux";
 			ranges = <0 0x09210000 0x10000>;
 
+			pio20: pio@09210000 {
+				gpio-controller;
+				#gpio-cells = <1>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+				reg = <0x0 0x100>;
+				st,bank-name = "PIO20";
+			};
+
 			tsin4 {
 				pinctrl_tsin4_serial_alt1: tsin4_serial_alt1 {
 					st,pins {
@@ -926,15 +948,6 @@
 						PKCLK = <&pio20 2 ALT1 IN SE_NICLK_IO 0 CLK_A>;
 					};
 				};
-			};
-
-			pio20: pio@09210000 {
-				gpio-controller;
-				#gpio-cells = <1>;
-				interrupt-controller;
-				#interrupt-cells = <2>;
-				reg = <0x0 0x100>;
-				st,bank-name = "PIO20";
 			};
 		};
 
