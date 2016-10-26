@@ -547,6 +547,7 @@ acpi_verify_and_map_madt(struct acpi_madt_generic_interrupt *processor)
 		}
 		bootcpu_valid = true;
 		arm_pmu_parse_acpi(0, processor);
+		early_map_cpu_to_node(0, acpi_numa_get_nid(0, hwid));
 		return;
 	}
 
