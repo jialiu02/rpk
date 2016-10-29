@@ -11,6 +11,7 @@
  */
 #define pr_fmt(fmt) "hw perfevents: " fmt
 
+#include <linux/acpi.h>
 #include <linux/bitmap.h>
 #include <linux/cpumask.h>
 #include <linux/cpu_pm.h>
@@ -24,6 +25,7 @@
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
 
+#include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/irq_regs.h>
 
@@ -534,6 +536,24 @@ static int armpmu_filter_match(struct perf_event *event)
 	return cpumask_test_cpu(cpu, &armpmu->supported_cpus);
 }
 
+static ssize_t armpmu_cpumask_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct arm_pmu *armpmu = to_arm_pmu(dev_get_drvdata(dev));
+	return cpumap_print_to_pagebuf(true, buf, &armpmu->supported_cpus);
+}
+
+static DEVICE_ATTR(cpus, S_IRUGO, armpmu_cpumask_show, NULL);
+
+static struct attribute *armpmu_common_attrs[] = {
+	&dev_attr_cpus.attr,
+	NULL,
+};
+
+static struct attribute_group armpmu_common_attr_group = {
+	.attrs = armpmu_common_attrs,
+};
+
 static void armpmu_init(struct arm_pmu *armpmu)
 {
 	atomic_set(&armpmu->active_events, 0);
@@ -549,7 +569,10 @@ static void armpmu_init(struct arm_pmu *armpmu)
 		.stop		= armpmu_stop,
 		.read		= armpmu_read,
 		.filter_match	= armpmu_filter_match,
+		.attr_groups	= armpmu->attr_groups,
 	};
+	armpmu->attr_groups[ARMPMU_ATTR_GROUP_COMMON] =
+		&armpmu_common_attr_group;
 }
 
 /* Set at runtime when we know what CPU type we are. */
@@ -602,7 +625,7 @@ static void cpu_pmu_free_irq(struct arm_pmu *cpu_pmu)
 	irqs = min(pmu_device->num_resources, num_possible_cpus());
 
 	irq = platform_get_irq(pmu_device, 0);
-	if (irq >= 0 && irq_is_percpu(irq)) {
+	if (irq > 0 && irq_is_percpu(irq)) {
 		on_each_cpu_mask(&cpu_pmu->supported_cpus,
 				 cpu_pmu_disable_percpu_irq, &irq, 1);
 		free_percpu_irq(irq, &hw_events->percpu_pmu);
@@ -616,7 +639,7 @@ static void cpu_pmu_free_irq(struct arm_pmu *cpu_pmu)
 			if (!cpumask_test_and_clear_cpu(cpu, &cpu_pmu->active_irqs))
 				continue;
 			irq = platform_get_irq(pmu_device, i);
-			if (irq >= 0)
+			if (irq > 0)
 				free_irq(irq, per_cpu_ptr(&hw_events->percpu_pmu, cpu));
 		}
 	}
@@ -638,7 +661,7 @@ static int cpu_pmu_request_irq(struct arm_pmu *cpu_pmu, irq_handler_t handler)
 	}
 
 	irq = platform_get_irq(pmu_device, 0);
-	if (irq >= 0 && irq_is_percpu(irq)) {
+	if (irq > 0 && irq_is_percpu(irq)) {
 		err = request_percpu_irq(irq, handler, "arm-pmu",
 					 &hw_events->percpu_pmu);
 		if (err) {
@@ -691,6 +714,34 @@ static int cpu_pmu_request_irq(struct arm_pmu *cpu_pmu, irq_handler_t handler)
 static DEFINE_SPINLOCK(arm_pmu_lock);
 static LIST_HEAD(arm_pmu_list);
 
+static void arm_perf_associate_new_cpu(struct arm_pmu *lpmu, unsigned int cpu)
+{
+	if (lpmu) {
+		struct platform_device *pdev = lpmu->plat_device;
+		struct resource *res;
+		struct pmu_hw_events *events;
+		int num_res;
+
+		for (num_res = 0; num_res < pdev->num_resources; num_res++) {
+			if (!pdev->resource[num_res].flags)
+				break;
+		}
+		res = &pdev->resource[num_res];
+
+		arm_pmu_acpi_retrieve_irq(res, cpu);
+		events = per_cpu_ptr(lpmu->hw_events, cpu);
+		cpumask_set_cpu(cpu, &lpmu->supported_cpus);
+		if (lpmu->irq_affinity)
+			lpmu->irq_affinity[num_res] = cpu;
+		pdev->num_resources++;
+		events->percpu_pmu = lpmu;
+		if (lpmu->reset)
+			lpmu->reset(lpmu);
+	} else {
+		pr_err("ACPI: unknown PMU type, unable to enable\n");
+	}
+}
+
 /*
  * PMU hardware loses all context when a CPU goes offline.
  * When a CPU is hotplugged back in, since some hardware registers are
@@ -700,15 +751,22 @@ static LIST_HEAD(arm_pmu_list);
 static int arm_perf_starting_cpu(unsigned int cpu)
 {
 	struct arm_pmu *pmu;
+	struct arm_pmu *lpmu = NULL;
+	bool found = false;
+	unsigned int cpuid = read_specific_cpuid(cpu);
 
 	spin_lock(&arm_pmu_lock);
 	list_for_each_entry(pmu, &arm_pmu_list, entry) {
-
+		if (cpuid == pmu->id)
+			lpmu = pmu;
 		if (!cpumask_test_cpu(cpu, &pmu->supported_cpus))
 			continue;
+		found = true;
 		if (pmu->reset)
 			pmu->reset(pmu);
 	}
+	if (!(found || acpi_disabled))
+		arm_perf_associate_new_cpu(lpmu, cpu);
 	spin_unlock(&arm_pmu_lock);
 	return 0;
 }
@@ -876,25 +934,69 @@ static void cpu_pmu_destroy(struct arm_pmu *cpu_pmu)
 }
 
 /*
- * CPU PMU identification and probing.
+ * CPU PMU identification and probing. Its possible to have
+ * multiple CPU types in an ARM machine. Assure that we are
+ * picking the right PMU types based on the CPU in question
  */
-static int probe_current_pmu(struct arm_pmu *pmu,
-			     const struct pmu_probe_info *info)
+static int probe_plat_pmu(struct arm_pmu *pmu,
+			     const struct pmu_probe_info *info,
+			     unsigned int pmuid)
 {
-	int cpu = get_cpu();
-	unsigned int cpuid = read_cpuid_id();
 	int ret = -ENODEV;
+	int cpu;
+	int aff_ctr = 0;
+	static int duplicate_pmus;
+	struct platform_device *pdev = pmu->plat_device;
+	int irq = platform_get_irq(pdev, 0);
 
-	pr_info("probing PMU on CPU %d\n", cpu);
+	pmu->id = pmuid;
 
+	if (irq >= 0 && !irq_is_percpu(irq)) {
+		pmu->irq_affinity = kcalloc(pdev->num_resources, sizeof(int),
+					    GFP_KERNEL);
+		if (!pmu->irq_affinity)
+			return -ENOMEM;
+	}
+
+	for_each_possible_cpu(cpu) {
+		unsigned int cpuid = read_specific_cpuid(cpu);
+
+		if (cpuid == pmuid) {
+			cpumask_set_cpu(cpu, &pmu->supported_cpus);
+			if (pmu->irq_affinity) {
+				pmu->irq_affinity[aff_ctr] = cpu;
+				aff_ctr++;
+			}
+		}
+	}
+
+	/* find the type of PMU given the CPU */
 	for (; info->init != NULL; info++) {
-		if ((cpuid & info->mask) != info->cpuid)
+		if ((pmuid & info->mask) != info->cpuid)
 			continue;
 		ret = info->init(pmu);
+		/*
+		 * if this pmu declaration is unspecified and we have
+		 * previously found a PMU on this platform then append
+		 * a PMU number to the pmu name. This avoids changing
+		 * the names of PMUs that are specific to a class of CPUs.
+		 * The assumption is that if we match a specific PMU in the
+		 * provided pmu_probe_info then it's unique, and another PMU
+		 * in the system will match a different entry rather than
+		 * needing the _number to assure its unique.
+		 */
+		if ((!info->cpuid) && (duplicate_pmus)) {
+			pmu->name = kasprintf(GFP_KERNEL, "%s_%d",
+					    pmu->name, duplicate_pmus);
+			if (!pmu->name) {
+				kfree(pmu->irq_affinity);
+				ret = -ENOMEM;
+			}
+		}
+		duplicate_pmus++;
 		break;
 	}
 
-	put_cpu();
 	return ret;
 }
 
@@ -919,7 +1021,7 @@ static int of_pmu_irq_cfg(struct arm_pmu *pmu)
 
 		/* Check the IRQ type and prohibit a mix of PPIs and SPIs */
 		irq = platform_get_irq(pdev, i);
-		if (irq >= 0) {
+		if (irq > 0) {
 			bool spi = !irq_is_percpu(irq);
 
 			if (i > 0 && spi != using_spi) {
@@ -970,7 +1072,7 @@ static int of_pmu_irq_cfg(struct arm_pmu *pmu)
 	if (cpumask_weight(&pmu->supported_cpus) == 0) {
 		int irq = platform_get_irq(pdev, 0);
 
-		if (irq >= 0 && irq_is_percpu(irq)) {
+		if (irq > 0 && irq_is_percpu(irq)) {
 			/* If using PPIs, check the affinity of the partition */
 			int ret;
 
@@ -1029,15 +1131,21 @@ int arm_pmu_device_probe(struct platform_device *pdev,
 		ret = of_pmu_irq_cfg(pmu);
 		if (!ret)
 			ret = init_fn(pmu);
-	} else {
-		cpumask_setall(&pmu->supported_cpus);
-		ret = probe_current_pmu(pmu, probe_table);
+	} else if (probe_table) {
+		if (acpi_disabled) {
+			/* use the current cpu. */
+			ret = probe_plat_pmu(pmu, probe_table,
+					     read_cpuid_id());
+		} else {
+			ret = probe_plat_pmu(pmu, probe_table, pdev->id);
+		}
 	}
 
 	if (ret) {
 		pr_info("%s: failed to probe PMU!\n", of_node_full_name(node));
 		goto out_free;
 	}
+
 
 	ret = cpu_pmu_init(pmu);
 	if (ret)

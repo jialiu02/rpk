@@ -38,6 +38,7 @@ struct bus_type;
 struct device;
 struct iommu_domain;
 struct notifier_block;
+struct fwnode_handle;
 
 /* iommu fault flags */
 #define IOMMU_FAULT_READ	0x0
@@ -331,10 +332,35 @@ extern struct iommu_group *pci_device_group(struct device *dev);
 /* Generic device grouping function */
 extern struct iommu_group *generic_device_group(struct device *dev);
 
+/**
+ * struct iommu_fwspec - per-device IOMMU instance data
+ * @ops: ops for this device's IOMMU
+ * @iommu_fwnode: firmware handle for this device's IOMMU
+ * @iommu_priv: IOMMU driver private data for this device
+ * @num_ids: number of associated device IDs
+ * @ids: IDs which this device may present to the IOMMU
+ */
+struct iommu_fwspec {
+	const struct iommu_ops	*ops;
+	struct fwnode_handle	*iommu_fwnode;
+	void			*iommu_priv;
+	unsigned int		num_ids;
+	u32			ids[1];
+};
+
+int iommu_fwspec_init(struct device *dev, struct fwnode_handle *iommu_fwnode,
+		      const struct iommu_ops *ops);
+void iommu_fwspec_free(struct device *dev);
+int iommu_fwspec_add_ids(struct device *dev, u32 *ids, int num_ids);
+void fwspec_iommu_set_ops(struct fwnode_handle *fwnode,
+			  const struct iommu_ops *ops);
+const struct iommu_ops *fwspec_iommu_get_ops(struct fwnode_handle *fwnode);
+
 #else /* CONFIG_IOMMU_API */
 
 struct iommu_ops {};
 struct iommu_group {};
+struct iommu_fwspec {};
 
 static inline bool iommu_present(struct bus_type *bus)
 {
@@ -541,6 +567,58 @@ static inline void iommu_device_unlink(struct device *dev, struct device *link)
 {
 }
 
+static inline int iommu_fwspec_init(struct device *dev,
+				    struct fwnode_handle *iommu_fwnode,
+				    const struct iommu_ops *ops)
+{
+	return -ENODEV;
+}
+
+static inline void iommu_fwspec_free(struct device *dev)
+{
+}
+
+static inline int iommu_fwspec_add_ids(struct device *dev, u32 *ids,
+				       int num_ids)
+{
+	return -ENODEV;
+}
+
+static inline void fwspec_iommu_set_ops(struct fwnode_handle *fwnode,
+					const struct iommu_ops *ops)
+{
+}
+
+static inline
+const struct iommu_ops *fwspec_iommu_get_ops(struct fwnode_handle *fwnode)
+{
+	return NULL;
+}
+
 #endif /* CONFIG_IOMMU_API */
+
+/* IOMMU fwnode handling */
+static inline bool is_fwnode_iommu(struct fwnode_handle *fwnode)
+{
+	return fwnode && fwnode->type == FWNODE_IOMMU;
+}
+
+static inline struct fwnode_handle *iommu_alloc_fwnode(void)
+{
+	struct fwnode_handle *fwnode;
+
+	fwnode = kzalloc(sizeof(struct fwnode_handle), GFP_KERNEL);
+	fwnode->type = FWNODE_IOMMU;
+
+	return fwnode;
+}
+
+static inline void iommu_free_fwnode(struct fwnode_handle *fwnode)
+{
+	if (WARN_ON(!is_fwnode_iommu(fwnode)))
+		return;
+
+	kfree(fwnode);
+}
 
 #endif /* __LINUX_IOMMU_H */
